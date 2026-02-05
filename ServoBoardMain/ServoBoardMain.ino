@@ -69,15 +69,15 @@ void setup() {
         Serial.println("创建 CAN 队列失败"); while (1);
     }
 
-    // // 创建上位机通信任务
-    // xTaskCreate(
-    //     taskUpperComm,           // 任务函数
-    //     "UpperComm",            // 任务名称
-    //     UPPER_COMM_TASK_STACK_SIZE, // 堆栈大小
-    //     &sharedData,           // 传递共享数据指针
-    //     TASK_UPPER_COMM_PRIORITY, // 优先级
-    //     &taskUpperCommHandle    // 任务句柄
-    // );
+    // 创建上位机通信任务
+    xTaskCreate(
+        taskUpperComm,           // 任务函数
+        "UpperComm",            // 任务名称
+        UPPER_COMM_TASK_STACK_SIZE, // 堆栈大小
+        &sharedData,           // 传递共享数据指针
+        TASK_UPPER_COMM_PRIORITY, // 优先级
+        &taskUpperCommHandle    // 任务句柄
+    );
     
     // // 创建舵机控制任务
     // xTaskCreate(
@@ -114,7 +114,7 @@ void loop() {
     // 每 200ms 打印一次（避免串口阻塞）
     if (millis() - lastPrintTime > 200) {
         lastPrintTime = millis();
-        printCanMonitor();
+        // printCanMonitor();
     }
 
     // 必须保留延时，防止触发看门狗！

@@ -1,144 +1,225 @@
 #include "UpperCommTask.h"
-#include <Arduino.h>
+#include "TaskSharedData.h"
+#include "CanCommTask.h"
 
-// 定义数据上报频率 (ms)，防止串口缓冲区在低波特率下溢出
-// 如果你的波特率是 115200，建议 >= 50ms。如果是 921600，可以设为 10ms。
-#define REPORT_INTERVAL_MS 50 
-
-/**
- * @brief 手动构建 JSON 字符串并发送，避免引入额外的 ArduinoJson 库
- * 格式示例: {"ts":1000,"s":[[1,2048,100],[2,1024,0]...],"e":[10,20,30...]}
- * ts: 时间戳
- * s: 舵机数组 [[ID, 位置, 负载], ...]
- * e: 磁编数组 [值1, 值2, ...]
- */
-void sendDataPacket(uint32_t timestamp, ServoStatus_t* servoStatus, RemoteSensorData_t* canData) {
-    // 静态缓冲区，1024字节通常足以容纳20个舵机+21个磁编的数据
-    static char buffer[1024];
+// ---------------------------------------------------------
+// 将 CAN 接收到的原始数据转为 JSON 格式并通过串口发送
+// ---------------------------------------------------------
+void sendDataPacket(uint32_t timestamp, ServoStatus_t* servoStatus, RemoteSensorData_t* sensorData) {
+    
+    // 定义缓冲区 (足够容纳 21 个编码器数据)
+    char jsonBuffer[1024]; 
     int offset = 0;
 
-    // 1. 开始 JSON 构造
-    offset += snprintf(buffer + offset, sizeof(buffer) - offset, "{\"ts\":%lu", timestamp);
+    // JSON 开始
+    offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "{");
 
-    // 2. 添加舵机数据 (Key: "s")
-    if (servoStatus != NULL && servoStatus->totalServoNum > 0) {
-        offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",\"s\":[");
-        for (int i = 0; i < servoStatus->totalServoNum; i++) {
-            offset += snprintf(buffer + offset, sizeof(buffer) - offset, 
-                "[%d,%d,%d]", 
-                servoStatus->states[i].id, 
-                servoStatus->states[i].absolutePos, 
-                servoStatus->states[i].currentLoad);
-            
-            if (i < servoStatus->totalServoNum - 1) {
-                // 如果缓冲区空间不足，提前截断防止崩溃
-                if (sizeof(buffer) - offset < 20) break; 
-                offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",");
-            }
+    // 1. 处理来自 S3 的磁编数据 (如果有效)
+    if (sensorData && sensorData->isValid) {
+        // ts: P4接收时间戳
+        // emap: S3上传的全局错误位图 (Error Bitmap from CAN ID 0x1F0)
+        offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, 
+                           "\"ts\":%lu,\"emap\":%u,\"enc\":[", 
+                           sensorData->timestamp, 
+                           sensorData->errorBitmap);
+
+        // 填充编码器原始值数组 (Raw Values 0~16383)
+        for (int i = 0; i < ENCODER_TOTAL_NUM; i++) {
+            offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, 
+                               "%d%s", 
+                               sensorData->encoderValues[i], 
+                               (i < ENCODER_TOTAL_NUM - 1) ? "," : "");
         }
-        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "]");
+
+        // 填充单体错误标志数组 (Flags)
+        offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, 
+                           "],\"err\":[");
+        for (int i = 0; i < ENCODER_TOTAL_NUM; i++) {
+            offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, 
+                               "%d%s", 
+                               sensorData->errorFlags[i], 
+                               (i < ENCODER_TOTAL_NUM - 1) ? "," : "");
+        }
+        offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "]");
     }
 
-    // 3. 添加磁编数据 (Key: "e")
-    // 假设 RemoteSensorData_t 中的 encoderValues 固定为 21 个长度
-    if (canData != NULL) {
-        offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",\"e\":[");
-        for (int i = 0; i < 21; i++) {
-            offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%d", canData->encoderValues[i]);
-            
-            if (i < 20) {
-                offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",");
-            }
-        }
-        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "]");
-    }
+    // 2. (可选) 可以在此添加 P4 本地的舵机状态数据上传逻辑
+    // ...
 
-    // 4. 结束 JSON 并添加换行符
-    offset += snprintf(buffer + offset, sizeof(buffer) - offset, "}\n");
-
-    // 5. 通过串口发送
-    Serial.write(buffer, offset);
+    // JSON 结束并换行 (作为数据包分隔符)
+    offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "}\n");
+    
+    // 直接发送至电脑
+    Serial.write(jsonBuffer, offset);
 }
 
 void taskUpperComm(void *parameter) {
     TaskSharedData_t* sharedData = (TaskSharedData_t*)parameter;
     
-    // 发送一条非 JSON 的日志，Python 端在解析 JSON 出错时可以 print 出来看
-    Serial.println("# 上位机通信任务已就绪 (Protocol: JSON Lines)");
-
-    // 本地缓存数据
-    ServoStatus_t currentStatus;
-    RemoteSensorData_t currentCanData;
+    ServoStatus_t servoStatus;
+    RemoteSensorData_t sensorData;
     
-    bool hasServoData = false;
-    bool hasCanData = false;
-    
-    uint32_t lastReportTime = 0;
-    String inputBuffer = ""; // 用于缓存串口输入命令
+    // 初始化
+    memset(&servoStatus, 0, sizeof(servoStatus));
+    memset(&sensorData, 0, sizeof(sensorData));
 
-    while (true) {
-        // ---------------------------------------------------------
-        // 1. 处理串口接收 (非阻塞读取)
-        // ---------------------------------------------------------
-        while (Serial.available()) {
-            char c = Serial.read();
-            if (c == '\n' || c == '\r') {
-                // 收到换行符，处理命令
-                inputBuffer.trim(); // 去除可能的空白符
-                if (inputBuffer.length() > 0) {
-                    ServoCommand_t cmd;
-                    cmd.timestamp = millis();
-
-                    if (inputBuffer.equalsIgnoreCase("s")) {
-                        cmd.command = 's'; // S: Stop
-                        xQueueSend(sharedData->cmdQueue, &cmd, portMAX_DELAY);
-                        // 可以选择是否回显，或者只发送 JSON 状态
-                        // Serial.println("{\"msg\":\"STOP_CMD_RECEIVED\"}");
-                    } 
-                    else if (inputBuffer.equalsIgnoreCase("r")) {
-                        cmd.command = 'r'; // R: Resume
-                        xQueueSend(sharedData->cmdQueue, &cmd, portMAX_DELAY);
-                        // Serial.println("{\"msg\":\"RESUME_CMD_RECEIVED\"}");
-                    }
-                    else {
-                        // 其它扩展命令处理
-                    }
-                }
-                inputBuffer = ""; // 清空缓冲区
-            } else {
-                inputBuffer += c; // 累加字符
-            }
+    for (;;) {
+        // 非阻塞读取最新状态
+        bool hasSensor = (xQueuePeek(sharedData->canRxQueue, &sensorData, 0) == pdTRUE);
+        bool hasServo  = (xQueuePeek(sharedData->statusQueue, &servoStatus, 0) == pdTRUE);
+        
+        // 只要有 CAN 磁编数据就上传
+        if (hasSensor) {
+            sendDataPacket(millis(), hasServo ? &servoStatus : NULL, &sensorData);
         }
 
-        // ---------------------------------------------------------
-        // 2. 从队列获取最新数据 (非阻塞)
-        // ---------------------------------------------------------
-        if (xQueueReceive(sharedData->statusQueue, &currentStatus, 0) == pdTRUE) {
-            hasServoData = true;
-        }
-
-        if (xQueueReceive(sharedData->canRxQueue, &currentCanData, 0) == pdTRUE) {
-            hasCanData = true;
-        }
-
-        // ---------------------------------------------------------
-        // 3. 定时打包上报
-        // ---------------------------------------------------------
-        uint32_t now = millis();
-        if (now - lastReportTime >= REPORT_INTERVAL_MS) {
-            // 只有当至少有一种数据时才发送，避免发送空包
-            if (hasServoData || hasCanData) {
-                sendDataPacket(now, 
-                               hasServoData ? &currentStatus : NULL, 
-                               hasCanData ? &currentCanData : NULL);
-            }
-            lastReportTime = now;
-        }
-
-        // 释放 CPU 给其他任务
-        vTaskDelay(pdMS_TO_TICKS(5));
+        // 限制上传频率为 20Hz (50ms)，避免串口拥塞
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
+
+
+// #include "UpperCommTask.h"
+// #include <Arduino.h>
+
+// // 定义数据上报频率 (ms)，防止串口缓冲区在低波特率下溢出
+// // 如果你的波特率是 115200，建议 >= 50ms。如果是 921600，可以设为 10ms。
+// #define REPORT_INTERVAL_MS 50 
+
+// /**
+//  * @brief 手动构建 JSON 字符串并发送，避免引入额外的 ArduinoJson 库
+//  * 格式示例: {"ts":1000,"s":[[1,2048,100],[2,1024,0]...],"e":[10,20,30...]}
+//  * ts: 时间戳
+//  * s: 舵机数组 [[ID, 位置, 负载], ...]
+//  * e: 磁编数组 [值1, 值2, ...]
+//  */
+// void sendDataPacket(uint32_t timestamp, ServoStatus_t* servoStatus, RemoteSensorData_t* canData) {
+//     // 静态缓冲区，1024字节通常足以容纳20个舵机+21个磁编的数据
+//     static char buffer[1024];
+//     int offset = 0;
+
+//     // 1. 开始 JSON 构造
+//     offset += snprintf(buffer + offset, sizeof(buffer) - offset, "{\"ts\":%lu", timestamp);
+
+//     // 2. 添加舵机数据 (Key: "s")
+//     if (servoStatus != NULL && servoStatus->totalServoNum > 0) {
+//         offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",\"s\":[");
+//         for (int i = 0; i < servoStatus->totalServoNum; i++) {
+//             offset += snprintf(buffer + offset, sizeof(buffer) - offset, 
+//                 "[%d,%d,%d]", 
+//                 servoStatus->states[i].id, 
+//                 servoStatus->states[i].absolutePos, 
+//                 servoStatus->states[i].currentLoad);
+            
+//             if (i < servoStatus->totalServoNum - 1) {
+//                 // 如果缓冲区空间不足，提前截断防止崩溃
+//                 if (sizeof(buffer) - offset < 20) break; 
+//                 offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",");
+//             }
+//         }
+//         offset += snprintf(buffer + offset, sizeof(buffer) - offset, "]");
+//     }
+
+//     // 3. 添加磁编数据 (Key: "e")
+//     // 假设 RemoteSensorData_t 中的 encoderValues 固定为 21 个长度
+//     if (canData != NULL) {
+//         offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",\"e\":[");
+//         for (int i = 0; i < 21; i++) {
+//             offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%d", canData->encoderValues[i]);
+            
+//             if (i < 20) {
+//                 offset += snprintf(buffer + offset, sizeof(buffer) - offset, ",");
+//             }
+//         }
+//         offset += snprintf(buffer + offset, sizeof(buffer) - offset, "]");
+//     }
+
+//     // 4. 结束 JSON 并添加换行符
+//     offset += snprintf(buffer + offset, sizeof(buffer) - offset, "}\n");
+
+//     // 5. 通过串口发送
+//     Serial.write(buffer, offset);
+// }
+
+// void taskUpperComm(void *parameter) {
+//     TaskSharedData_t* sharedData = (TaskSharedData_t*)parameter;
+    
+//     // 发送一条非 JSON 的日志，Python 端在解析 JSON 出错时可以 print 出来看
+//     Serial.println("# 上位机通信任务已就绪 (Protocol: JSON Lines)");
+
+//     // 本地缓存数据
+//     ServoStatus_t currentStatus;
+//     RemoteSensorData_t currentCanData;
+    
+//     bool hasServoData = false;
+//     bool hasCanData = false;
+    
+//     uint32_t lastReportTime = 0;
+//     String inputBuffer = ""; // 用于缓存串口输入命令
+
+//     while (true) {
+//         // ---------------------------------------------------------
+//         // 1. 处理串口接收 (非阻塞读取)
+//         // ---------------------------------------------------------
+//         while (Serial.available()) {
+//             char c = Serial.read();
+//             if (c == '\n' || c == '\r') {
+//                 // 收到换行符，处理命令
+//                 inputBuffer.trim(); // 去除可能的空白符
+//                 if (inputBuffer.length() > 0) {
+//                     ServoCommand_t cmd;
+//                     cmd.timestamp = millis();
+
+//                     if (inputBuffer.equalsIgnoreCase("s")) {
+//                         cmd.command = 's'; // S: Stop
+//                         xQueueSend(sharedData->cmdQueue, &cmd, portMAX_DELAY);
+//                         // 可以选择是否回显，或者只发送 JSON 状态
+//                         // Serial.println("{\"msg\":\"STOP_CMD_RECEIVED\"}");
+//                     } 
+//                     else if (inputBuffer.equalsIgnoreCase("r")) {
+//                         cmd.command = 'r'; // R: Resume
+//                         xQueueSend(sharedData->cmdQueue, &cmd, portMAX_DELAY);
+//                         // Serial.println("{\"msg\":\"RESUME_CMD_RECEIVED\"}");
+//                     }
+//                     else {
+//                         // 其它扩展命令处理
+//                     }
+//                 }
+//                 inputBuffer = ""; // 清空缓冲区
+//             } else {
+//                 inputBuffer += c; // 累加字符
+//             }
+//         }
+
+//         // ---------------------------------------------------------
+//         // 2. 从队列获取最新数据 (非阻塞)
+//         // ---------------------------------------------------------
+//         if (xQueueReceive(sharedData->statusQueue, &currentStatus, 0) == pdTRUE) {
+//             hasServoData = true;
+//         }
+
+//         if (xQueueReceive(sharedData->canRxQueue, &currentCanData, 0) == pdTRUE) {
+//             hasCanData = true;
+//         }
+
+//         // ---------------------------------------------------------
+//         // 3. 定时打包上报
+//         // ---------------------------------------------------------
+//         uint32_t now = millis();
+//         if (now - lastReportTime >= REPORT_INTERVAL_MS) {
+//             // 只有当至少有一种数据时才发送，避免发送空包
+//             if (hasServoData || hasCanData) {
+//                 sendDataPacket(now, 
+//                                hasServoData ? &currentStatus : NULL, 
+//                                hasCanData ? &currentCanData : NULL);
+//             }
+//             lastReportTime = now;
+//         }
+
+//         // 释放 CPU 给其他任务
+//         vTaskDelay(pdMS_TO_TICKS(5));
+//     }
+// }
 
 
 

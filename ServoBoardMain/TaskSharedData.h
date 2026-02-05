@@ -61,12 +61,18 @@ static const InitConfig SERVO_INIT_SEQUENCE[] = {
 
 
 // --- 【新增】来自 ESP32-S3 的传感器数据结构 ---
+// typedef struct {
+//     uint16_t encoderValues[21]; // 示例：接收到的编码器数据
+//     uint8_t  sensorStatus;
+//     uint32_t timestamp;
+// } RemoteSensorData_t;
 typedef struct {
-    uint16_t encoderValues[21]; // 示例：接收到的编码器数据
-    uint8_t  sensorStatus;
-    uint32_t timestamp;
+    uint16_t encoderValues[21];             // 编码器角度值 (0~16383)
+    uint8_t  errorFlags[21];                // 【新增】单个编码器错误标志 (1=错误, 0=正常)
+    uint32_t errorBitmap;                   // 【新增】全局错误位图 (来自 CAN 0x1F0)
+    uint32_t timestamp;                     // 数据时间戳
+    bool     isValid;                       // 【新增】数据有效性标志
 } RemoteSensorData_t;
-
 
 // --- 【新增】发送给 ESP32-S3 的指令结构 ---
 typedef struct {
