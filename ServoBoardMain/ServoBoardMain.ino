@@ -25,6 +25,10 @@ TaskHandle_t taskCanCommHandle   = NULL; // 【新增】CAN 任务句柄
 // 共享数据结构实例
 TaskSharedData_t sharedData;
 
+// --- [新增] 全局标志位，用于跨任务显示校准结果 ---
+// 0:无状态, 1:进行中, 2:成功, 3:失败
+volatile uint8_t g_calibrationUIStatus = 0; 
+
 void setup() {
     // 初始化串口
     Serial.begin(921600);
@@ -32,7 +36,7 @@ void setup() {
         delay(10);
     }
     delay(1000);
-    Serial.println("FEETECH BUS Servo 控制系统启动");
+    // Serial.println("FEETECH BUS Servo 控制系统启动");
     
     // // 初始化舵机管理器
     // servoManagers[0]->begin(0, UART1_rxPin, UART1_txPin, BUS0_IDS);
@@ -48,14 +52,14 @@ void setup() {
     // 创建命令队列
     sharedData.cmdQueue = xQueueCreate(5, sizeof(ServoCommand_t));
     if (sharedData.cmdQueue == NULL) {
-        Serial.println("创建命令队列失败");
+        // Serial.println("创建命令队列失败");
         while (1);
     }
     
     // 创建状态队列
     sharedData.statusQueue = xQueueCreate(3, sizeof(ServoStatus_t));
     if (sharedData.statusQueue == NULL) {
-        Serial.println("创建状态队列失败");
+        // Serial.println("创建状态队列失败");
         while (1);
     }
 
@@ -66,7 +70,7 @@ void setup() {
     sharedData.canTxQueue = xQueueCreate(5, sizeof(RemoteCommand_t));
 
     if (sharedData.canRxQueue == NULL || sharedData.canTxQueue == NULL) {
-        Serial.println("创建 CAN 队列失败"); while (1);
+        // Serial.println("创建 CAN 队列失败"); while (1);
     }
 
     // 创建上位机通信任务
@@ -102,10 +106,10 @@ void setup() {
     // 删除默认的Arduino loop任务
     // vTaskDelete(NULL);
 
-    Serial.println("FreeRTOS任务创建完成");
-    Serial.println("系统准备就绪");
-    Serial.println("可用命令: s(停止), r(恢复)");
-    Serial.println("======================================");
+    // Serial.println("FreeRTOS任务创建完成");
+    // Serial.println("系统准备就绪");
+    // Serial.println("可用命令: s(停止), r(恢复)");
+    // Serial.println("======================================");
 }
 
 void loop() {

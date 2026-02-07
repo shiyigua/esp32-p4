@@ -1,82 +1,187 @@
 #include "UpperCommTask.h"
-#include "TaskSharedData.h"
 #include "CanCommTask.h"
+extern volatile uint8_t g_calibrationUIStatus;
 
-// ---------------------------------------------------------
-// 将 CAN 接收到的原始数据转为 JSON 格式并通过串口发送
-// ---------------------------------------------------------
-void sendDataPacket(uint32_t timestamp, ServoStatus_t* servoStatus, RemoteSensorData_t* sensorData) {
-    
-    // 定义缓冲区 (足够容纳 21 个编码器数据)
-    char jsonBuffer[1024]; 
-    int offset = 0;
+// --- 协议定义 ---
+#define PROTOCOL_HEADER        0xFE
+#define PROTOCOL_TAIL          0xFF
+#define PACKET_TYPE_SENSOR     0x01
+#define PACKET_TYPE_CALIB_ACK  0x02
 
-    // JSON 开始
-    offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "{");
+// 内部辅助：发送数据包
+void sendDataPacket(ServoStatus_t* pServo, RemoteSensorData_t* pSensor) {
+    uint8_t buffer[64];
+    size_t idx = 0;
 
-    // 1. 处理来自 S3 的磁编数据 (如果有效)
-    if (sensorData && sensorData->isValid) {
-        // ts: P4接收时间戳
-        // emap: S3上传的全局错误位图 (Error Bitmap from CAN ID 0x1F0)
-        offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, 
-                           "\"ts\":%lu,\"emap\":%u,\"enc\":[", 
-                           sensorData->timestamp, 
-                           sensorData->errorBitmap);
+    // 1. 帧头
+    buffer[idx++] = PROTOCOL_HEADER;
+    buffer[idx++] = 0x00; // 长度占位
 
-        // 填充编码器原始值数组 (Raw Values 0~16383)
+    // 2. 负载内容
+    if (g_calibrationUIStatus != 0) {
+        // [高优先级] 校准状态反馈
+        buffer[idx++] = PACKET_TYPE_CALIB_ACK;
+        buffer[idx++] = g_calibrationUIStatus; 
+        // g_calibrationUIStatus = 0; // 发送后清除状态，避免重复
+    } 
+    else if (pSensor) {
+        // [常规] 传感器数据
+        buffer[idx++] = PACKET_TYPE_SENSOR;
         for (int i = 0; i < ENCODER_TOTAL_NUM; i++) {
-            offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, 
-                               "%d%s", 
-                               sensorData->encoderValues[i], 
-                               (i < ENCODER_TOTAL_NUM - 1) ? "," : "");
+            uint16_t val = pSensor->encoderValues[i];
+            buffer[idx++] = (val >> 8) & 0xFF;
+            buffer[idx++] = val & 0xFF;
         }
-
-        // 填充单体错误标志数组 (Flags)
-        offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, 
-                           "],\"err\":[");
-        for (int i = 0; i < ENCODER_TOTAL_NUM; i++) {
-            offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, 
-                               "%d%s", 
-                               sensorData->errorFlags[i], 
-                               (i < ENCODER_TOTAL_NUM - 1) ? "," : "");
-        }
-        offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "]");
+    } else {
+        return; // 无数据
     }
 
-    // 2. (可选) 可以在此添加 P4 本地的舵机状态数据上传逻辑
-    // ...
+    // 3. 填充长度与帧尾
+    // buffer[1] = idx - 2; 
+    buffer[idx++] = PROTOCOL_TAIL;
 
-    // JSON 结束并换行 (作为数据包分隔符)
-    offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "}\n");
-    
-    // 直接发送至电脑
-    Serial.write(jsonBuffer, offset);
+    // 4. 正确计算 LEN: LEN = TYPE + PAYLOAD + TAIL
+    // 注意：idx 已包含 TAIL，所以 LEN = idx - 2 (减去 FE 和 LEN 自身)
+    buffer[1] = (uint8_t)(idx - 2);
+
+    // 4. 写串口
+    Serial.write(buffer, idx);
+
+        // 【关键】仅在此处清除状态（防止重复发送）
+    if (g_calibrationUIStatus != 0) {
+        g_calibrationUIStatus = 0;
+    }
 }
 
+// --- 主任务函数 ---
 void taskUpperComm(void *parameter) {
     TaskSharedData_t* sharedData = (TaskSharedData_t*)parameter;
-    
-    ServoStatus_t servoStatus;
     RemoteSensorData_t sensorData;
     
-    // 初始化
-    memset(&servoStatus, 0, sizeof(servoStatus));
-    memset(&sensorData, 0, sizeof(sensorData));
+    Serial.println("<<<SYS_READY>>>"); // 启动标志
 
     for (;;) {
-        // 非阻塞读取最新状态
-        bool hasSensor = (xQueuePeek(sharedData->canRxQueue, &sensorData, 0) == pdTRUE);
-        bool hasServo  = (xQueuePeek(sharedData->statusQueue, &servoStatus, 0) == pdTRUE);
-        
-        // 只要有 CAN 磁编数据就上传
-        if (hasSensor) {
-            sendDataPacket(millis(), hasServo ? &servoStatus : NULL, &sensorData);
+        // ====================================================
+        // [Part 1] 接收：处理来自 PC 的指令 (RX)
+        // ====================================================
+        if (Serial.available()) {
+            uint8_t rxByte = Serial.read();
+            
+            // 简单指令解析: 'c' 或 0xCA 触发校准
+            if (rxByte == 'c' || rxByte == 0xCA) {
+                RemoteCommand_t cmd;
+                cmd.cmdID = 0x200;    // 目标: S3
+                cmd.len = 1;
+                cmd.payload[0] = 0xCA; // 内容: Calibrate
+
+                // 发送给 CAN 任务
+                if (xQueueSend(sharedData->canTxQueue, &cmd, 0) == pdTRUE) {
+                    g_calibrationUIStatus = 1; // 设置本地状态为 PENDING
+                }
+            }
+            // 可以在此扩展其他指令，例如 's' 停止等
         }
 
-        // 限制上传频率为 20Hz (50ms)，避免串口拥塞
-        vTaskDelay(pdMS_TO_TICKS(50));
+        // ====================================================
+        // [Part 2] 发送：上传状态与数据 (TX)
+        // ====================================================
+        
+        // 尝试从队列获取最新的传感器数据
+        // 使用 Receive 移除队列中旧数据，保证实时性
+        if (xQueueReceive(sharedData->canRxQueue, &sensorData, 0) == pdTRUE) {
+            sendDataPacket(NULL, &sensorData);
+        }
+        // 如果没有传感器数据，但有校准状态变化 (Success/Fail)，也需要立即发送
+        else if (g_calibrationUIStatus != 0) {
+            sendDataPacket(NULL, NULL);
+        }
+
+        // 任务调度延时
+        // 既要保证 input 响应快，又要避免 output 发送太快堵塞串口
+        vTaskDelay(pdMS_TO_TICKS(5)); 
     }
 }
+
+
+// #include "UpperCommTask.h"
+// #include "TaskSharedData.h"
+// #include "CanCommTask.h"
+
+// // ---------------------------------------------------------
+// // 将 CAN 接收到的原始数据转为 JSON 格式并通过串口发送
+// // ---------------------------------------------------------
+// void sendDataPacket(uint32_t timestamp, ServoStatus_t* servoStatus, RemoteSensorData_t* sensorData) {
+    
+//     // 定义缓冲区 (足够容纳 21 个编码器数据)
+//     char jsonBuffer[1024]; 
+//     int offset = 0;
+
+//     // JSON 开始
+//     offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "{");
+
+//     // 1. 处理来自 S3 的磁编数据 (如果有效)
+//     if (sensorData && sensorData->isValid) {
+//         // ts: P4接收时间戳
+//         // emap: S3上传的全局错误位图 (Error Bitmap from CAN ID 0x1F0)
+//         offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, 
+//                            "\"ts\":%lu,\"emap\":%u,\"enc\":[", 
+//                            sensorData->timestamp, 
+//                            sensorData->errorBitmap);
+
+//         // 填充编码器原始值数组 (Raw Values 0~16383)
+//         for (int i = 0; i < ENCODER_TOTAL_NUM; i++) {
+//             offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, 
+//                                "%d%s", 
+//                                sensorData->encoderValues[i], 
+//                                (i < ENCODER_TOTAL_NUM - 1) ? "," : "");
+//         }
+
+//         // 填充单体错误标志数组 (Flags)
+//         offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, 
+//                            "],\"err\":[");
+//         for (int i = 0; i < ENCODER_TOTAL_NUM; i++) {
+//             offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, 
+//                                "%d%s", 
+//                                sensorData->errorFlags[i], 
+//                                (i < ENCODER_TOTAL_NUM - 1) ? "," : "");
+//         }
+//         offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "]");
+//     }
+
+//     // 2. (可选) 可以在此添加 P4 本地的舵机状态数据上传逻辑
+//     // ...
+
+//     // JSON 结束并换行 (作为数据包分隔符)
+//     offset += snprintf(jsonBuffer + offset, sizeof(jsonBuffer) - offset, "}\n");
+    
+//     // 直接发送至电脑
+//     Serial.write(jsonBuffer, offset);
+// }
+
+// void taskUpperComm(void *parameter) {
+//     TaskSharedData_t* sharedData = (TaskSharedData_t*)parameter;
+    
+//     ServoStatus_t servoStatus;
+//     RemoteSensorData_t sensorData;
+    
+//     // 初始化
+//     memset(&servoStatus, 0, sizeof(servoStatus));
+//     memset(&sensorData, 0, sizeof(sensorData));
+
+//     for (;;) {
+//         // 非阻塞读取最新状态
+//         bool hasSensor = (xQueuePeek(sharedData->canRxQueue, &sensorData, 0) == pdTRUE);
+//         bool hasServo  = (xQueuePeek(sharedData->statusQueue, &servoStatus, 0) == pdTRUE);
+        
+//         // 只要有 CAN 磁编数据就上传
+//         if (hasSensor) {
+//             sendDataPacket(millis(), hasServo ? &servoStatus : NULL, &sensorData);
+//         }
+
+//         // 限制上传频率为 20Hz (50ms)，避免串口拥塞
+//         vTaskDelay(pdMS_TO_TICKS(50));
+//     }
+// }
 
 
 // #include "UpperCommTask.h"

@@ -23,7 +23,7 @@ static void setupTwai() {
         installed = true;
         Serial.println("[CAN] Driver Installed OK");
     } else {
-        Serial.println("[CAN] Driver Install FAILED");
+        // Serial.println("[CAN] Driver Install FAILED");
     }
 }
 
@@ -37,6 +37,7 @@ void taskCanComm(void *parameter) {
 
     twai_message_t rxMsg;
     uint32_t lastRxTime = 0;
+    RemoteCommand_t txCmd;
 
     for (;;) {
         // ==========================================
@@ -104,19 +105,29 @@ void taskCanComm(void *parameter) {
             // Serial.println("[CAN] RX Timeout");
         }
 
+        // [TX] 发送指令 (如校准)
+        // 使用 Receive 读出指令
+        if (xQueueReceive(sharedData->canTxQueue, &txCmd, 0) == pdTRUE) {
+            twai_message_t txMsg;
+            txMsg.identifier = txCmd.cmdID;
+            txMsg.extd = 0;
+            txMsg.data_length_code = txCmd.len;
+            memcpy(txMsg.data, txCmd.payload, txCmd.len);
+            twai_transmit(&txMsg, pdMS_TO_TICKS(10));
+        }
         // ==========================================
         // 3. 发送队列处理 (来自上位机的指令)
         // ==========================================
-        RemoteCommand_t cmd;
-        if (sharedData->canTxQueue && xQueueReceive(sharedData->canTxQueue, &cmd, 0) == pdTRUE) {
-            twai_message_t txMsg;
-            txMsg.identifier = cmd.cmdID;
-            txMsg.extd = 0;
-            txMsg.rtr = 0;
-            txMsg.data_length_code = cmd.len;
-            memcpy(txMsg.data, cmd.payload, cmd.len);
-            twai_transmit(&txMsg, pdMS_TO_TICKS(10));
-        }
+        // RemoteCommand_t cmd;
+        // if (sharedData->canTxQueue && xQueueReceive(sharedData->canTxQueue, &cmd, 0) == pdTRUE) {
+        //     twai_message_t txMsg;
+        //     txMsg.identifier = cmd.cmdID;
+        //     txMsg.extd = 0;
+        //     txMsg.rtr = 0;
+        //     txMsg.data_length_code = cmd.len;
+        //     memcpy(txMsg.data, cmd.payload, cmd.len);
+        //     twai_transmit(&txMsg, pdMS_TO_TICKS(10));
+        // }
 
         vTaskDelay(pdMS_TO_TICKS(5)); // 5ms 周期
     }
