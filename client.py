@@ -156,8 +156,10 @@ def serial_thread_func(port_name):
 # ================= 界面绘制 (UI) =================
 def print_ui():
     """ 绘制无闪烁的高可读性界面 """
-    # 将光标移动到左上角 (ANSI Code)
-    sys.stdout.write("\033[H")
+    # ====== 【关键修改】强制清屏 ======
+    # 先用 \033[2J 清除整个屏幕，再用 \033[H 回到顶部
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
 
     # --- 标题栏 ---
     print(f"{Back.BLUE}{Fore.WHITE}  XSimple S3 关节模组 - 总线监控终端  {Style.RESET_ALL}")
@@ -235,26 +237,51 @@ def print_ui():
 
 # ================= 主程序 =================
 def main():
-    # 1. 查找端口
-    ports = serial.tools.list_ports.comports()
+    # === 【新增】动态端口选择循环 ===
     target_port = None
+    while not target_port:
+        os.system('cls' if os.name == 'nt' else 'clear')
+        print("🔍 正在扫描可用串口...")
 
-    # 清屏
-    os.system('cls' if os.name == 'nt' else 'clear')
+        ports = serial.tools.list_ports.comports()
+        valid_ports = [p.device for p in ports]
 
-    print("正在扫描端口...")
-    valid_ports = [p.device for p in ports]
+        if not valid_ports:
+            print(f"{Fore.RED}❌ 未检测到任何串口设备！请检查 USB 连接。\n{Style.RESET_ALL}")
+            print("按 Enter 键重试，或按 Ctrl+C 退出...")
+            try:
+                input()  # 等待用户按键
+            except KeyboardInterrupt:
+                return
+            continue
 
-    if not valid_ports:
-        print(f"{Fore.RED}未检测到串口设备！请检查 USB 连接。{Style.RESET_ALL}")
-        return
+        # 打印所有可用端口供用户选择
+        print(f"\n{Fore.CYAN}可用串口列表:{Style.RESET_ALL}")
+        for i, port in enumerate(valid_ports):
+            print(f"  [{i}] {port}  (描述: {ports[i].description})")
 
-    # 默认选择第一个，或根据名称筛选
-    print(valid_ports)
-    target_port = valid_ports[0]
-    print(f"正在连接到 {target_port} ...")
+        # 提示用户选择
+        try:
+            choice = input(f"\n请输入端口号编号 [{0}~{len(valid_ports) - 1}], 或直接回车选择默认第0个: ").strip()
+            if choice == "":
+                target_port = valid_ports[0]
+            else:
+                idx = int(choice)
+                if 0 <= idx < len(valid_ports):
+                    target_port = valid_ports[idx]
+                else:
+                    print(f"{Fore.YELLOW}⚠️  输入无效，请输入有效编号。{Style.RESET_ALL}")
+                    time.sleep(1)
+                    continue
+        except ValueError:
+            print(f"{Fore.YELLOW}⚠️  输入非数字，请重试。{Style.RESET_ALL}")
+            time.sleep(1)
+            continue
+        except KeyboardInterrupt:
+            return
 
-    # 2. 启动数据接收线程
+    # === 【关键】连接成功后，启动线程 ===
+    print(f"\n✅ 正在连接到 {target_port} ...")
     t = threading.Thread(target=serial_thread_func, args=(target_port,), daemon=True)
     t.start()
 
