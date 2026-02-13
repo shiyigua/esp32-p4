@@ -1,4 +1,7 @@
 #include "SystemTask.h"
+#include "ServoBusManager.h"  // 新增
+#include "AngleSolver.h"      // 新增
+
 
 // =============== 全局变量定义 ===============
 volatile uint8_t g_calibrationUIStatus = 0;
@@ -9,6 +12,7 @@ TaskSharedData_t sharedData;
 // 任务句柄
 TaskHandle_t taskUpperCommHandle = NULL;
 TaskHandle_t taskCanCommHandle   = NULL;
+TaskHandle_t taskSolverHandle    = NULL;  // 【新增】解算任务句柄
 
 // 注意：原 ino 中的 ServoManager 相关变量已被注释，因未启用 ServoCtrlTask，
 // 若后续需启用，请在该文件中取消注释并添加相应头文件。
@@ -20,6 +24,33 @@ ServoManager* servoManagers[NUM_SERVO_BUSES] = {
     &servoManager1
 };
 */
+
+
+// 【新增】4路舵机总线管理器实例
+ServoBusManager servoBus0;
+ServoBusManager servoBus1;
+ServoBusManager servoBus2;
+ServoBusManager servoBus3;
+
+// 【新增】角度解算器实例
+AngleSolver angleSolver;
+
+
+// 【新增】关节映射表: 将 0-20 索引映射到 (BusIndex, ServoID)
+// 请根据实际硬件连线修改
+JointMapItem jointMap[ENCODER_TOTAL_NUM] = {
+    // Bus 0 (4个关节)
+    {0, 1}, {0, 2}, {0, 3}, {0, 4},
+    // Bus 1 (4个关节)
+    {1, 1}, {1, 2}, {1, 3}, {1, 4},
+    // Bus 2 (4个关节)
+    {2, 1}, {2, 2}, {2, 3}, {2, 4},
+    // Bus 3 (5个关节)
+    {3, 1}, {3, 2}, {3, 3}, {3, 4}, {3, 5},
+    // 剩余4个关节（根据实际分配）
+    {0, 5}, {1, 5}, {2, 5}, {3, 6}  // 示例分配，请根据实际调整
+};
+
 
 // =============== 系统初始化函数 ===============
 void System_Init() {
@@ -59,6 +90,52 @@ void System_Init() {
     sharedData.canTxQueue  = xQueueCreate(5, sizeof(RemoteCommand_t));
 
     
+    if (!sharedData.cmdQueue || !sharedData.statusQueue ||
+        !sharedData.canRxQueue || !sharedData.canTxQueue) {
+        while (1);
+    }
+
+    // 【新增】创建目标角度互斥锁
+    sharedData.targetAnglesMutex = xSemaphoreCreateMutex();
+    if (!sharedData.targetAnglesMutex) {
+        while (1);
+    }
+
+    // 【新增】初始化目标角度为 0（防止上电飞车）
+    memset(sharedData.targetAngles, 0, sizeof(sharedData.targetAngles));
+
+    // 【新增】初始化 4 路舵机总线
+    // 请根据 AppConfig.h 或实际引脚修改参数
+    // servoBus0.begin(UART_NUM_1, BUS0_RX_PIN, BUS0_TX_PIN, SERVO_BAUDRATE);
+    // servoBus1.begin(UART_NUM_2, BUS1_RX_PIN, BUS1_TX_PIN, SERVO_BAUDRATE);
+    // servoBus2.begin(UART_NUM_3, BUS2_RX_PIN, BUS2_TX_PIN, SERVO_BAUDRATE);
+    // servoBus3.begin(UART_NUM_4, BUS3_RX_PIN, BUS3_TX_PIN, SERVO_BAUDRATE);
+
+servoBus0.begin(0, 16, 17, 1000000);  // 总线0: RX=16, TX=17, 波特率1Mbps
+servoBus1.begin(1, 18, 19, 1000000);  // 总线1: RX=18, TX=19
+servoBus2.begin(2, 20, 21, 1000000);  // 总线2: RX=20, TX=21（根据实际修改）
+servoBus3.begin(3, 22, 23, 1000000);  // 总线3: RX=22, TX=23（根据实际修改）
+
+    // 【新增】初始化 AngleSolver
+    int16_t zeros[ENCODER_TOTAL_NUM];
+    float   ratios[ENCODER_TOTAL_NUM];
+    int8_t  dirs[ENCODER_TOTAL_NUM];
+
+    for (int i = 0; i < ENCODER_TOTAL_NUM; i++) {
+        zeros[i]  = 2048;   // 默认中位
+        ratios[i] = 1.0f;
+        dirs[i]   = 1;
+    }
+    angleSolver.init(zeros, ratios, dirs);
+
+    // 【新增】设置 PID 参数 (双环)
+    float pidConfigs[2][PID_PARAMETER_NUM] = {
+        {20.0f, 0.0f, 0.0f, 0.0f, 0.0f, 3000.0f},   // 外环(位置): Mag -> Correction
+        { 5.0f, 0.0f, 0.0f, 0.0f, 0.0f, 30719.0f}    // 内环(舵机): Correction -> Servo
+    };
+    angleSolver.setPIDParams(pidConfigs);
+
+
     // 创建上位机通信任务
     xTaskCreate(
         taskUpperComm,
@@ -78,6 +155,14 @@ void System_Init() {
         TASK_CAN_COMM_PRIORITY,
         &taskCanCommHandle
     );
+
+    // 【新增】创建解算任务
+    xTaskCreate(taskSolver, 
+        "Solver",
+         SOLVER_TASK_STACK_SIZE, 
+         &sharedData,
+        TASK_SOLVER_PRIORITY, 
+        &taskSolverHandle);
 
     Serial.println("✅ FreeRTOS tasks created successfully.");
     Serial.println("System ready. Commands: s(停止), r(恢复)");

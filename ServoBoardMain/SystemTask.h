@@ -5,14 +5,19 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>      // 【新增】
+
 
 // 应用层头文件
 #include "TaskSharedData.h"
 #include "UpperCommTask.h"
 #include "CanCommTask.h"
+#include "AngleSolver.h"          // 【新增】引入 AngleSolver（含 taskSolver 声明）
+#include "ServoBusManager.h"      // 【新增】引入舵机总线管理器
+
 
 // 关节数量定义
-#define ENCODER_TOTAL_NUM 21
+// #define ENCODER_TOTAL_NUM 21//现存canconmmtask.h中
 
 // 全局状态标志位（跨任务共享）
 extern volatile uint8_t g_calibrationUIStatus;

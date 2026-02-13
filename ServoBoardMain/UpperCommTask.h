@@ -6,7 +6,7 @@
 #include <freertos/task.h>
 #include "TaskSharedData.h"
 
-#define UPPER_COMM_TASK_STACK_SIZE 8192
+// #define UPPER_COMM_TASK_STACK_SIZE 8192//已调整位置
 void taskUpperComm(void *parameter);
 
 #endif
