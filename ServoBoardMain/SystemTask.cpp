@@ -61,26 +61,6 @@ void System_Init() {
     }
     delay(1000);
 
-    //由于整理该部分被舍弃
-    // // 创建命令队列
-    // sharedData.cmdQueue = xQueueCreate(5, sizeof(ServoCommand_t));
-    // if (sharedData.cmdQueue == NULL) {
-    //     while (1); // 死循环，等待调试
-    // }
-
-    // // 创建状态队列
-    // sharedData.statusQueue = xQueueCreate(3, sizeof(ServoStatus_t));
-    // if (sharedData.statusQueue == NULL) {
-    //     while (1);
-    // }
-
-    // // 【新增】创建 CAN 相关队列
-    // sharedData.canRxQueue = xQueueCreate(1, sizeof(RemoteSensorData_t));
-    // sharedData.canTxQueue = xQueueCreate(5, sizeof(RemoteCommand_t));
-
-    // if (sharedData.canRxQueue == NULL || sharedData.canTxQueue == NULL) {
-    //     while (1);
-    // }
 
     
     // 1. 创建队列 (资源分配)
@@ -104,12 +84,6 @@ void System_Init() {
     // 【新增】初始化目标角度为 0（防止上电飞车）
     memset(sharedData.targetAngles, 0, sizeof(sharedData.targetAngles));
 
-    // 【新增】初始化 4 路舵机总线
-    // 请根据 AppConfig.h 或实际引脚修改参数
-    // servoBus0.begin(UART_NUM_1, BUS0_RX_PIN, BUS0_TX_PIN, SERVO_BAUDRATE);
-    // servoBus1.begin(UART_NUM_2, BUS1_RX_PIN, BUS1_TX_PIN, SERVO_BAUDRATE);
-    // servoBus2.begin(UART_NUM_3, BUS2_RX_PIN, BUS2_TX_PIN, SERVO_BAUDRATE);
-    // servoBus3.begin(UART_NUM_4, BUS3_RX_PIN, BUS3_TX_PIN, SERVO_BAUDRATE);
 
 servoBus0.begin(0, 16, 17, 1000000);  // 总线0: RX=16, TX=17, 波特率1Mbps
 servoBus1.begin(1, 18, 19, 1000000);  // 总线1: RX=18, TX=19
